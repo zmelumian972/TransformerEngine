@@ -324,6 +324,29 @@ def canonicalize_attn_mask_type(attn_mask_type: str):
     )
 
 
+def _is_blackwell_d256_cutedsl_bprop_available() -> bool:
+    """Check if the cuteDSL Blackwell d=256 bprop kernel is available.
+
+    Requires:
+    - nvidia-cutlass-dsl package (provides cutlass.cute JIT compiler)
+    - SM100+ (Blackwell) GPU hardware
+    """
+    import importlib.util
+
+    if importlib.util.find_spec("cutlass") is None:
+        return False
+    try:
+        import transformer_engine_jax
+
+        compute_caps = [
+            transformer_engine_jax.get_device_compute_capability(i)
+            for i in range(len(jax.local_devices()))
+        ]
+        return any(cc >= 100 for cc in compute_caps)
+    except Exception:
+        return False
+
+
 def is_fused_attn_kernel_available(
     is_training,
     q_dtype,
@@ -365,7 +388,42 @@ def is_fused_attn_kernel_available(
             window_size_tuple,
         )
 
-    return make_helper(attn_mask_type).is_fused_attn_kernel_available()
+    if make_helper(attn_mask_type).is_fused_attn_kernel_available():
+        return True
+
+    # cuDNN does not support d=256 bprop on Blackwell (SM100+); check for cuteDSL fallback.
+    # The cuteDSL path only supports BSHD separate layout, no bias, and no dropout.
+    if (
+        is_training
+        and head_dim_qk == 256
+        and head_dim_v == 256
+        and qkv_layout == QKVLayout.BSHD_BSHD_BSHD
+        and attn_bias_type == AttnBiasType.NO_BIAS
+        and dropout_probability == 0.0
+        and _is_blackwell_d256_cutedsl_bprop_available()
+    ):
+        # Verify the fprop-only kernel is available (prerequisite for the forward pass;
+        # the backward pass uses cuteDSL instead of cuDNN).
+        fprop_helper = tex.FusedAttnHelper(
+            False,
+            q_dtype,
+            kv_dtype,
+            qkv_layout,
+            attn_bias_type,
+            attn_mask_type,
+            softmax_type,
+            dropout_probability,
+            q_num_heads,
+            kv_num_heads,
+            q_max_seqlen,
+            kv_max_seqlen,
+            head_dim_qk,
+            head_dim_v,
+            window_size_tuple,
+        )
+        return fprop_helper.is_fused_attn_kernel_available()
+
+    return False
 
 
 def _obtain_batch_and_max_seqlen(qkv, qkv_layout):

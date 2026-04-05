@@ -3521,6 +3521,133 @@ def fused_attn_fwd(
     return (output, softmax_aux, rng_state)
 
 
+def _import_cutedsl_bwd():
+    """Import sdpa_bwd_wrapper_sm100_d256, locating cudnn-frontend Python package if needed."""
+    import os
+    import sys
+
+    try:
+        from cudnn.sdpa.api import sdpa_bwd_wrapper_sm100_d256  # pylint: disable=import-outside-toplevel
+
+        return sdpa_bwd_wrapper_sm100_d256
+    except ImportError:
+        pass
+    # Try to locate cudnn-frontend relative to the transformer_engine package installation root.
+    import transformer_engine  # pylint: disable=import-outside-toplevel
+
+    te_root = os.path.dirname(os.path.dirname(os.path.abspath(transformer_engine.__file__)))
+    cudnn_python_path = os.path.join(te_root, "3rdparty", "cudnn-frontend", "python")
+    if os.path.isdir(cudnn_python_path) and cudnn_python_path not in sys.path:
+        sys.path.insert(0, cudnn_python_path)
+    from cudnn.sdpa.api import sdpa_bwd_wrapper_sm100_d256  # pylint: disable=import-outside-toplevel
+
+    return sdpa_bwd_wrapper_sm100_d256
+
+
+def _fused_attn_bwd_blackwell_d256_cutedsl(
+    qkv: Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray],
+    softmax_aux: jnp.ndarray,
+    output: jnp.ndarray,
+    doutput: jnp.ndarray,
+    attn_mask_type: AttnMaskType,
+    scaling_factor: float,
+    window_size: Optional[Tuple[int, int]],
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Backward pass for SDPA with head_dim=256 on Blackwell (SM100+) using the cuteDSL kernel.
+
+    This path is used when cuDNN does not support d=256 backward on Blackwell.  The forward pass
+    uses cuDNN (d=256 fprop is supported on Blackwell since cuDNN 9.9), while the backward pass
+    dispatches to the cudnn-frontend Python cuteDSL kernel (requires nvidia-cutlass-dsl).
+
+    Tensors use BSHD layout: Q/K/V/O/dO shape ``(B, S, H, D)``, LSE shape ``(B, H, S, 1)``.
+
+    The cuteDSL kernel requires PyTorch tensors.  Inputs are shared zero-copy via DLPack;
+    outputs require a device-to-host copy (a known limitation of ``jax.pure_callback``).
+
+    Args:
+        qkv: Tuple of (query, key, value) in BSHD layout.
+        softmax_aux: Log-sum-exp values from the forward pass, shape ``(B, H, S, 1)``.
+        output: Forward pass output, shape ``(B, S, H, D)``.
+        doutput: Output gradient, shape ``(B, S, H, D)``.
+        attn_mask_type: Attention mask type (NO_MASK or CAUSAL_MASK).
+        scaling_factor: Softmax scaling factor.
+        window_size: Sliding-window attention sizes ``(left, right)``, or ``None`` for full window.
+
+    Returns:
+        Tuple of gradient tensors ``(dq, dk, dv)`` in BSHD layout.
+    """
+    import numpy as np  # pylint: disable=import-outside-toplevel
+
+    q, k, v = qkv
+    # BSHD (B, S, H, D); cuteDSL B,H,S,D mode expects (B, H, S, D) with BSHD strides.
+    # Transposing dims 1 and 2 of a contiguous BSHD tensor gives a non-contiguous (B, H, S, D)
+    # view whose stride_order matches the (3, 1, 2, 0) requirement of the cuteDSL kernel.
+    q_shape = q.shape  # (B, S, H, D)
+    k_shape = k.shape  # (B, S_k, H_kv, D)
+    v_shape = v.shape  # (B, S_k, H_kv, D)
+    # softmax_aux (LSE) in BSHD mode has shape (B, H, S, 1); squeeze to (B, H, S).
+    lse = softmax_aux.squeeze(-1)  # (B, H, S)
+
+    is_causal = attn_mask_type in (AttnMaskType.CAUSAL_MASK, AttnMaskType.PADDING_CAUSAL_MASK)
+    window_size_tuple = (-1, -1) if window_size is None else window_size
+
+    def _bwd_callback(q_arr, k_arr, v_arr, o_arr, do_arr, lse_arr):
+        """Call the cuteDSL bprop kernel; inputs are on-device JAX arrays (DLPack-accessible)."""
+        import torch  # pylint: disable=import-outside-toplevel
+
+        # Zero-copy conversion to PyTorch via DLPack; tensors keep the BSHD stride layout.
+        q_pt = torch.from_dlpack(q_arr)  # (B, S, H, D) – contiguous BSHD
+        k_pt = torch.from_dlpack(k_arr)
+        v_pt = torch.from_dlpack(v_arr)
+        o_pt = torch.from_dlpack(o_arr)
+        do_pt = torch.from_dlpack(do_arr)
+        lse_pt = torch.from_dlpack(lse_arr)  # (B, H, S) – contiguous
+
+        # cuteDSL B,H,S,D mode: pass (B, H, S, D) tensors with BSHD strides.
+        # .transpose(1, 2) on a (B, S, H, D) contiguous tensor gives (B, H, S, D)
+        # non-contiguous with stride_order (3, 1, 2, 0), as required by the kernel.
+        q_t = q_pt.transpose(1, 2)
+        k_t = k_pt.transpose(1, 2)
+        v_t = v_pt.transpose(1, 2)
+        o_t = o_pt.transpose(1, 2)
+        do_t = do_pt.transpose(1, 2)
+
+        sdpa_bwd = _import_cutedsl_bwd()
+        result = sdpa_bwd(
+            q_tensor=q_t,
+            k_tensor=k_t,
+            v_tensor=v_t,
+            o_tensor=o_t,
+            do_tensor=do_t,
+            lse_tensor=lse_pt,
+            is_causal=is_causal,
+            window_size=window_size_tuple,
+            scale_softmax=scaling_factor,
+        )
+        # result.dq_tensor / dk_tensor / dv_tensor have shape (B, H, S, D) with BSHD strides.
+        # Transpose back to (B, S, H, D) for TE's BSHD layout and copy to host for JAX.
+        dq_np = np.asarray(result.dq_tensor.transpose(1, 2).contiguous().cpu())
+        dk_np = np.asarray(result.dk_tensor.transpose(1, 2).contiguous().cpu())
+        dv_np = np.asarray(result.dv_tensor.transpose(1, 2).contiguous().cpu())
+        return dq_np, dk_np, dv_np
+
+    dq, dk, dv = jax.pure_callback(
+        _bwd_callback,
+        (
+            jax.ShapeDtypeStruct(q_shape, q.dtype),
+            jax.ShapeDtypeStruct(k_shape, k.dtype),
+            jax.ShapeDtypeStruct(v_shape, v.dtype),
+        ),
+        q,
+        k,
+        v,
+        output,
+        doutput,
+        lse,
+    )
+    return dq, dk, dv
+
+
 def fused_attn_bwd(
     qkv: Tuple[jnp.ndarray, ...],
     bias: Optional[jnp.ndarray],
@@ -3637,6 +3764,35 @@ def fused_attn_bwd(
             )
 
     compute_capabilities = get_all_device_compute_capability()
+
+    # cuDNN does not support d=256 bprop on Blackwell (SM100+).  When nvidia-cutlass-dsl is
+    # installed, route the backward pass through the cuteDSL Python kernel instead.
+    # Only BSHD separate layout with no bias and no dropout is currently supported.
+    if (
+        any(cc >= 100 for cc in compute_capabilities)
+        and is_training
+        and qkv_layout == QKVLayout.BSHD_BSHD_BSHD
+        and attn_bias_type == AttnBiasType.NO_BIAS
+        and dropout_probability == 0.0
+        and qkv[0].shape[-1] == 256  # head_dim_qk
+        and qkv[2].shape[-1] == 256  # head_dim_v
+    ):
+        import importlib.util  # pylint: disable=import-outside-toplevel
+
+        if importlib.util.find_spec("cutlass") is not None:
+            dq, dk, dv = _fused_attn_bwd_blackwell_d256_cutedsl(
+                qkv=(qkv[0], qkv[1], qkv[2]),
+                softmax_aux=softmax_aux,
+                output=output,
+                doutput=doutput,
+                attn_mask_type=attn_mask_type,
+                scaling_factor=scaling_factor,
+                window_size=window_size,
+            )
+            bias_grad = jnp.zeros(0, dtype=qkv[0].dtype)
+            softmax_offset_grad = jnp.zeros(0, dtype=jnp.float32)
+            return (dq, dk, dv), bias_grad, softmax_offset_grad
+
     if any(x >= 100 for x in compute_capabilities) and is_training:
         assert (
             FusedAttnHelper.is_non_deterministic_allowed()
