@@ -1391,6 +1391,42 @@ def _fused_attn_bwd_rule(
 _fused_attn.defvjp(_fused_attn_fwd_rule, _fused_attn_bwd_rule)
 
 
+def _fused_attn_with_masked_io(qkv, qkv_layout, q_segment_ids, kv_segment_ids, call_fn):
+    """Zero padding positions in Q/K/V before cuDNN fused attn and in output after.
+
+    cuDNN fused attn backward leaks values into segment_id==0 (padding) positions
+    when the call is wrapped in transposes. Zeroing inputs means leaked cotangents
+    hit zero-valued tensors and cannot escape into the model graph; zeroing the
+    output shields the forward pass and the dQ path from the same leak. Applies
+    to both BSHD and THD layouts. Mirrors _cudnn_packed_with_masked_output in
+    cattention.py.
+    """
+    q_mask = (q_segment_ids != 0)[..., None, None]   # [..., S, 1, 1]
+    kv_mask = (kv_segment_ids != 0)[..., None, None]
+
+    if qkv_layout.is_qkvpacked():
+        # BS3HD / T3HD: [..., S, 3, H, D] — Q is slice 0, K/V are 1/2.
+        # [..., S, 1, 1, 1] broadcasts over the 3-H-D dims.
+        packed = qkv[0]
+        qkv = (jnp.where(q_mask[..., None], packed, jnp.zeros_like(packed)),)
+    elif qkv_layout.is_kvpacked():
+        # BSHD_BS2HD / THD_T2HD
+        query, kv_packed = qkv
+        query = jnp.where(q_mask, query, jnp.zeros_like(query))
+        kv_packed = jnp.where(kv_mask[..., None], kv_packed, jnp.zeros_like(kv_packed))
+        qkv = (query, kv_packed)
+    else:
+        # BSHD_BSHD_BSHD / THD_THD_THD
+        query, key, value = qkv
+        query = jnp.where(q_mask, query, jnp.zeros_like(query))
+        key = jnp.where(kv_mask, key, jnp.zeros_like(key))
+        value = jnp.where(kv_mask, value, jnp.zeros_like(value))
+        qkv = (query, key, value)
+
+    output = call_fn(qkv)
+    return jnp.where(q_mask, output, jnp.zeros_like(output))
+
+
 def fused_attn(
     qkv: Tuple[jnp.ndarray, ...],
     bias: Optional[jnp.ndarray],
@@ -1520,25 +1556,32 @@ def fused_attn(
             UserWarning,
             stacklevel=2,
         )
-    output = _fused_attn(
-        qkv,
-        bias,
-        softmax_offset,
-        sequence_descriptor,
-        seed,
-        attn_bias_type=attn_bias_type,
-        attn_mask_type=attn_mask_type,
-        qkv_layout=qkv_layout,
-        softmax_type=softmax_type,
-        scaling_factor=scaling_factor,
-        dropout_probability=dropout_probability,
-        is_training=is_training,
-        max_segments_per_seq=max_segments_per_seq,
-        window_size=window_size,
-        context_parallel_strategy=context_parallel_strategy,
-        context_parallel_causal_load_balanced=context_parallel_causal_load_balanced,
-        context_parallel_axis=context_parallel_axis,
-        context_checkpoint_name=context_checkpoint_name,
-        stripe_size=stripe_size,
-    )
+    def _call(qkv_arg):
+        return _fused_attn(
+            qkv_arg,
+            bias,
+            softmax_offset,
+            sequence_descriptor,
+            seed,
+            attn_bias_type=attn_bias_type,
+            attn_mask_type=attn_mask_type,
+            qkv_layout=qkv_layout,
+            softmax_type=softmax_type,
+            scaling_factor=scaling_factor,
+            dropout_probability=dropout_probability,
+            is_training=is_training,
+            max_segments_per_seq=max_segments_per_seq,
+            window_size=window_size,
+            context_parallel_strategy=context_parallel_strategy,
+            context_parallel_causal_load_balanced=context_parallel_causal_load_balanced,
+            context_parallel_axis=context_parallel_axis,
+            context_checkpoint_name=context_checkpoint_name,
+            stripe_size=stripe_size,
+        )
+
+    q_segment_ids, kv_segment_ids = sequence_descriptor.segment_ids
+    if q_segment_ids.size > 0:
+        output = _fused_attn_with_masked_io(qkv, qkv_layout, q_segment_ids, kv_segment_ids, _call)
+    else:
+        output = _call(qkv)
     return output
